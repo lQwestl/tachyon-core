@@ -8933,6 +8933,48 @@ fn validate_server_tls(tls: &Value, at: &str, field_at: &str) -> Result<(), Stri
             "{at}: certificate_provider and acme are mutually exclusive"
         ));
     }
+    let reality_enabled = tls
+        .get("reality")
+        .and_then(Value::as_object)
+        .is_some_and(|r| r.get("enabled").and_then(Value::as_bool) == Some(true));
+    if reality_enabled {
+        if provider || acme {
+            return Err(format!(
+                "{at}: certificate_provider and reality are mutually exclusive"
+            ));
+        }
+        let reality = tls.get("reality").and_then(Value::as_object).unwrap();
+        let private_key = reality
+            .get("private_key")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if private_key.is_empty() {
+            return Err(format!("{at}: tls: reality: missing private_key"));
+        }
+        if decode_base64_url_raw(private_key).is_none_or(|k| k.len() != 32) {
+            return Err(format!("{at}: invalid private_key"));
+        }
+        if let Some(short_ids) = reality.get("short_id") {
+            match short_ids {
+                Value::String(s) => {
+                    if !s.is_empty() {
+                        check_short_id(s).map_err(|m| format!("{at}: {m}"))?;
+                    }
+                }
+                Value::Array(list) => {
+                    for item in list {
+                        if let Some(s) = item.as_str()
+                            && !s.is_empty()
+                        {
+                            check_short_id(s).map_err(|m| format!("{at}: {m}"))?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
     if provider {
         // the inline provider is built first, and only then does `insecure`
         // have nothing left to attach to
@@ -12843,6 +12885,31 @@ mod tests {
                 "{ty} took a tls block that is not an object"
             );
         }
+    }
+
+    #[test]
+    fn server_tls_accepts_reality_without_certificate() {
+        let valid_key = "dGhpc2lzYXNhbXBsZXJlYWxpdHlrZXkxMjM0NTY3ODk";
+        let valid = lx_json(&format!(
+            r#"{{"inbounds":[{{"type":"vless","users":[{{"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}}],"tls":{{"enabled":true,"reality":{{"enabled":true,"private_key":"{valid_key}"}}}}}}]}}"#
+        ));
+        assert!(validate(&valid).is_ok());
+
+        let missing_key = lx_json(
+            r#"{"inbounds":[{"type":"vless","users":[{"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}],"tls":{"enabled":true,"reality":{"enabled":true}}}]}"#,
+        );
+        assert_eq!(
+            validate(&missing_key).unwrap_err(),
+            "initialize inbound[0] vless[0]: tls: reality: missing private_key"
+        );
+
+        let invalid_key = lx_json(
+            r#"{"inbounds":[{"type":"vless","users":[{"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}],"tls":{"enabled":true,"reality":{"enabled":true,"private_key":"short"}}}]}"#,
+        );
+        assert_eq!(
+            validate(&invalid_key).unwrap_err(),
+            "initialize inbound[0] vless[0]: invalid private_key"
+        );
     }
 
     #[test]
