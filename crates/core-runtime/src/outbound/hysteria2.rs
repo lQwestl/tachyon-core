@@ -14,7 +14,6 @@ use serde_json::Value;
 use crate::inbound::udp::DEFAULT_UDP_TIMEOUT;
 use crate::inbound::{AnyStream, Target, network_includes_tcp, network_includes_udp};
 use crate::logging;
-use crate::outbound::proxy::server_endpoint;
 use crate::outbound::quic::{
     CongestionKind, Defragger, HY2_MAX_UDP, MBPS_TO_BPS, POOL_MAX_CONNS, POOL_STREAMS_PER_CONN,
     PoolLease, QuicStream, QuicTunnelDefaults, QuicTunnelOptions, SalamanderRelay, VarintReader,
@@ -57,7 +56,16 @@ pub struct Hysteria2 {
 
 impl Hysteria2 {
     pub fn build(obj: &serde_json::Map<String, Value>, at: &str) -> anyhow::Result<Self> {
-        let (server, port) = server_endpoint(obj, at)?;
+        let server = obj
+            .get("server")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("{at}: missing server"))?
+            .to_string();
+
+        let direct_port = obj
+            .get("server_port")
+            .and_then(Value::as_u64)
+            .and_then(|p| u16::try_from(p).ok());
 
         if obj
             .get("realm")
@@ -131,10 +139,20 @@ impl Hysteria2 {
                     ranges.push((start, end));
                 }
             }
-            let first_port = ranges.first().map(|&(s, _)| s).unwrap_or(port);
-            (ranges, first_port)
+            let initial_port = match direct_port {
+                Some(p) => p,
+                None => {
+                    let picked = pick_port_from_ranges(&ranges);
+                    if picked == 0 {
+                        anyhow::bail!("{at}: missing server_port");
+                    }
+                    picked
+                }
+            };
+            (ranges, initial_port)
         } else {
-            (Vec::new(), port)
+            let p = direct_port.ok_or_else(|| anyhow::anyhow!("{at}: missing server_port"))?;
+            (Vec::new(), p)
         };
 
         let hop_interval = if !server_port_ranges.is_empty() {
@@ -845,5 +863,39 @@ mod tests {
         assert_eq!(next_packet_id(&c), 2);
         c.store(65_534, Ordering::Relaxed);
         assert_eq!(next_packet_id(&c), 0);
+    }
+
+    #[test]
+    fn hy2_build_server_ports_without_server_port() {
+        let json = serde_json::json!({
+            "type": "hysteria2",
+            "server": "127.0.0.1",
+            "server_ports": ["63000:63999"],
+            "password": "secret",
+            "tls": {
+                "enabled": true,
+                "server_name": "example.com"
+            }
+        });
+        let map = json.as_object().unwrap();
+        let hy2 = Hysteria2::build(map, "outbounds[0]").expect("build should succeed");
+        assert!(hy2.port >= 63000 && hy2.port <= 63999);
+        assert_eq!(hy2.server_port_ranges, vec![(63000, 63999)]);
+    }
+
+    #[test]
+    fn hy2_build_missing_both_ports() {
+        let json = serde_json::json!({
+            "type": "hysteria2",
+            "server": "127.0.0.1",
+            "password": "secret",
+            "tls": {
+                "enabled": true,
+                "server_name": "example.com"
+            }
+        });
+        let map = json.as_object().unwrap();
+        let err = Hysteria2::build(map, "outbounds[0]").unwrap_err();
+        assert!(err.to_string().contains("missing server_port"));
     }
 }
