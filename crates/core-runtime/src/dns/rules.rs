@@ -130,9 +130,18 @@ impl Rule {
                     .ok_or_else(|| anyhow::anyhow!("{at}: unknown query_type {raw:?}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let domain = string_list(map, "domain", at)?;
-        let domain_suffix = string_list(map, "domain_suffix", at)?;
-        let domain_keyword = string_list(map, "domain_keyword", at)?;
+        let domain = string_list(map, "domain", at)?
+            .into_iter()
+            .map(|d| super::codec::normalize_name(&d))
+            .collect();
+        let domain_suffix = string_list(map, "domain_suffix", at)?
+            .into_iter()
+            .map(|s| super::codec::normalize_name(&s))
+            .collect();
+        let domain_keyword = string_list(map, "domain_keyword", at)?
+            .into_iter()
+            .map(|k| k.to_ascii_lowercase())
+            .collect();
         let domain_regex = string_list(map, "domain_regex", at)?
             .into_iter()
             .map(|expr| {
@@ -424,9 +433,6 @@ impl Rule {
                 return false;
             }
         }
-        if !self.domain.is_empty() && !self.domain.iter().any(|d| d == &query.name) {
-            return false;
-        }
         if !self.source_mac.is_empty() || !self.source_hostname.is_empty() {
             // the neighbour tables, when they are running at all
             let found = meta.source.and_then(|source| {
@@ -450,26 +456,27 @@ impl Rule {
                 return false;
             }
         }
-        if !self.domain_suffix.is_empty()
-            && !self
-                .domain_suffix
-                .iter()
-                .any(|suffix| domain_suffix_match(&query.name, suffix))
-        {
-            return false;
-        }
-        if !self.domain_keyword.is_empty()
-            && !self
-                .domain_keyword
-                .iter()
-                .any(|k| query.name.contains(k.as_str()))
-        {
-            return false;
-        }
-        if !self.domain_regex.is_empty()
-            && !self.domain_regex.iter().any(|re| re.is_match(&query.name))
-        {
-            return false;
+        let has_domain = !self.domain.is_empty()
+            || !self.domain_suffix.is_empty()
+            || !self.domain_keyword.is_empty()
+            || !self.domain_regex.is_empty();
+        if has_domain {
+            let matched = (!self.domain.is_empty() && self.domain.iter().any(|d| d == &query.name))
+                || (!self.domain_suffix.is_empty()
+                    && self
+                        .domain_suffix
+                        .iter()
+                        .any(|suffix| crate::route::rule::domain_suffix_match(&query.name, suffix)))
+                || (!self.domain_keyword.is_empty()
+                    && self
+                        .domain_keyword
+                        .iter()
+                        .any(|k| query.name.contains(k.as_str())))
+                || (!self.domain_regex.is_empty()
+                    && self.domain_regex.iter().any(|re| re.is_match(&query.name)));
+            if !matched {
+                return false;
+            }
         }
         true
     }
@@ -550,11 +557,6 @@ pub fn base64_decode(raw: &str) -> anyhow::Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD_NO_PAD
         .decode(cleaned)
         .map_err(|e| anyhow::anyhow!("illegal base64 data: {e}"))
-}
-
-fn domain_suffix_match(name: &str, suffix: &str) -> bool {
-    let suffix = super::codec::normalize_name(suffix);
-    name == suffix || name.ends_with(&format!(".{suffix}"))
 }
 
 /// `netip.ParsePrefix` with the reference's retry: a bare address is a
@@ -798,4 +800,55 @@ mod tests {
         assert!(!rule.matches(&meta, &info("a.test", RecordType::A)));
         assert!(rule.matches(&meta, &info("b.test", RecordType::A)));
     }
+
+    #[test]
+    fn mixed_domain_matchers_or_semantics() {
+        let rule = Rule::build(
+            &json!({
+                "action": "route",
+                "server": "fakeip-server",
+                "domain": ["exact.test"],
+                "domain_suffix": ["perplexity.ai", "oracle.com"],
+                "domain_keyword": ["search"]
+            }),
+            "rules[4]",
+        )
+        .unwrap();
+        let meta = QueryMeta::default();
+
+        // 1. Matches domain_suffix without matching keyword or exact domain
+        assert!(rule.matches(&meta, &info("perplexity.ai", RecordType::A)));
+        assert!(rule.matches(&meta, &info("api.perplexity.ai", RecordType::A)));
+        assert!(rule.matches(&meta, &info("oracle.com", RecordType::A)));
+
+        // 2. Matches domain_keyword without matching suffix or exact domain
+        assert!(rule.matches(&meta, &info("mysearchdomain.org", RecordType::A)));
+
+        // 3. Matches exact domain
+        assert!(rule.matches(&meta, &info("exact.test", RecordType::A)));
+
+        // 4. Non-matching queries
+        assert!(!rule.matches(&meta, &info("google.com", RecordType::A)));
+        assert!(!rule.matches(&meta, &info("notexact.test", RecordType::A)));
+    }
+
+    #[test]
+    fn mixed_domain_case_insensitive() {
+        let rule = Rule::build(
+            &json!({
+                "action": "route",
+                "server": "fakeip-server",
+                "domain": ["Exact.Test"],
+                "domain_suffix": ["Perplexity.AI"],
+                "domain_keyword": ["Search"]
+            }),
+            "rules[5]",
+        )
+        .unwrap();
+        let meta = QueryMeta::default();
+        assert!(rule.matches(&meta, &info("perplexity.ai", RecordType::A)));
+        assert!(rule.matches(&meta, &info("exact.test", RecordType::A)));
+        assert!(rule.matches(&meta, &info("mysearchdomain.org", RecordType::A)));
+    }
 }
+

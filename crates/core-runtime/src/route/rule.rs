@@ -1224,7 +1224,7 @@ pub(super) fn domain_host<'a>(ctx: &'a ConnContext) -> Option<Cow<'a, str>> {
 }
 
 /// Label-boundary suffix match; a leading-dot suffix is a pure string suffix.
-pub(super) fn domain_suffix_match(host: &str, suffix: &str) -> bool {
+pub(crate) fn domain_suffix_match(host: &str, suffix: &str) -> bool {
     if suffix.starts_with('.') {
         return host.ends_with(suffix);
     }
